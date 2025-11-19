@@ -1,4 +1,5 @@
 const std = @import("std");
+const game = @import("game_platform.zig");
 const wasapi = @import("bindings/wasapi.zig");
 const win_ext = @import("bindings/windows.zig");
 const xa2 = @import("bindings/xaudio2.zig");
@@ -145,26 +146,70 @@ const WS_OVERLAPPEDWINDOW = win_ext.WS_OVERLAPPEDWINDOW;
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 // Handmade Hero globals
 
+var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+const allocator = arena.allocator();
+
 var running: bool = undefined;
-var audio_is_busy: bool = false;
-var global_back_buffer: offscreen_buffer = undefined;
+var global_back_buffer: OffscreenBuffer = undefined;
 
-var xinput_get_state_ptr: ?*const fn (DWORD, *XINPUT_STATE) callconv(win.WINAPI) DWORD = XInputGetStateStub;
-var xinput_set_state_ptr: ?*const fn (DWORD, *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD = XInputSetStateStub;
-var xaudio2_create_ptr: ?*const fn (*?*IXAudio2, FLAGS, UINT32) callconv(win.WINAPI) HRESULT = XAudio2CreateStub;
+var xinput_get_state_ptr: ?*const fn (DWORD, *XINPUT_STATE) callconv(win.WINAPI) DWORD = xInputGetStateStub;
+var xinput_set_state_ptr: ?*const fn (DWORD, *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD = xInputSetStateStub;
+var xaudio2_create_ptr: ?*const fn (*?*IXAudio2, FLAGS, UINT32) callconv(win.WINAPI) HRESULT = xAudio2CreateStub;
 
-const bytes_per_pixel: c_int = 4;
+const default_pixel_size_in_bytes: c_int = 4;
 
 // NOTE:(Dean): Pixels are always 32-bits wide, memory order: BB GG RR XX
-const offscreen_buffer = struct {
+const OffscreenBuffer = struct {
     info: BITMAPINFO,
-    memory: ?*anyopaque,
-    width: c_int,
-    height: c_int,
-    pitch: c_int,
+    memory: []u8,
+    window_dimensions: WindowDimensions,
+    bytes_per_pixel: c_int,
+
+    pub fn init(self: *OffscreenBuffer, alloc: std.mem.Allocator, window_dimensions: WindowDimensions, bytes_per_pixel: c_int) !void {
+        const width = window_dimensions.width;
+        const height = window_dimensions.height;
+        const buffer_size: usize = @intCast(width * height * bytes_per_pixel);
+
+        self.*.memory = try alloc.alloc(u8, buffer_size);
+        self.*.window_dimensions = window_dimensions;
+        self.*.bytes_per_pixel = bytes_per_pixel;
+        self.*.info.bmiHeader.biSize = @sizeOf(BITMAPINFOHEADER);
+        self.*.info.bmiHeader.biWidth = width;
+        self.*.info.bmiHeader.biHeight = -height; // NOTE:(Dean) This is negative so that the origin is the top left corner. A positive value puts the origin in the bottom left corner.
+        self.*.info.bmiHeader.biPlanes = 1;
+        self.*.info.bmiHeader.biBitCount = 32;
+        self.*.info.bmiHeader.biCompression = BI_RGB;
+        self.*.info.bmiHeader.biSizeImage = 0;
+        self.*.info.bmiHeader.biXPelsPerMeter = 0;
+        self.*.info.bmiHeader.biYPelsPerMeter = 0;
+        self.*.info.bmiHeader.biClrUsed = 0;
+        self.*.info.bmiHeader.biClrImportant = 0;
+        self.*.info.bmiColors[0].rgbBlue = 0;
+        self.*.info.bmiColors[0].rgbGreen = 0;
+        self.*.info.bmiColors[0].rgbRed = 0;
+        self.*.info.bmiColors[0].rgbReserved = 0;
+    }
+
+    pub fn resize(self: *OffscreenBuffer, alloc: std.mem.Allocator, new_dimensions: WindowDimensions) !void {
+        const new_width = new_dimensions.width;
+        const new_height = new_dimensions.height;
+        const new_buffer_size: usize = @intCast(new_width * new_height * self.*.bytes_per_pixel);
+
+        alloc.free(self.*.memory);
+
+        self.*.memory = try alloc.alloc(u8, new_buffer_size);
+        self.*.window_dimensions = new_dimensions;
+        self.*.info.bmiHeader.biWidth = new_width;
+        self.*.info.bmiHeader.biHeight = -new_height; // NOTE:(Dean) See Note from init()
+    }
 };
 
-const sound_struct = struct {
+const WindowDimensions = struct {
+    width: i32,
+    height: i32,
+};
+
+const SoundInformation = struct {
     samples_per_second: u32,
     bytes_per_sample: u32,
     tone_hz: u32,
@@ -174,19 +219,7 @@ const sound_struct = struct {
     volume: f32,
 };
 
-pub fn succeeded(return_code: HRESULT) bool {
-    if (return_code < 0) {
-        std.debug.print("Failed with error code: {x}", .{return_code});
-    }
-
-    return return_code >= 0;
-}
-
-pub fn failed(return_code: HRESULT) bool {
-    return return_code < 0;
-}
-
-pub fn LoadXInput() void {
+pub fn loadXInput() void {
     const xinput_library: ?HMODULE = win_ext.LoadLibraryA("xinput1_3.dll");
 
     if (xinput_library != null) {
@@ -194,7 +227,7 @@ pub fn LoadXInput() void {
         xinput_get_state_ptr = @ptrCast(win_ext.GetProcAddress(xinput_library.?, "XInputGetState"));
         if (xinput_get_state_ptr == null) {
             std.debug.print("XInputGetState function not found\n", .{});
-            xinput_get_state_ptr = &XInputGetStateStub;
+            xinput_get_state_ptr = &xInputGetStateStub;
         } else {
             std.debug.print("XInputGetState function loaded successfully\n", .{});
         }
@@ -202,7 +235,7 @@ pub fn LoadXInput() void {
         xinput_set_state_ptr = @ptrCast(win_ext.GetProcAddress(xinput_library.?, "XInputSetState"));
         if (xinput_set_state_ptr == null) {
             std.debug.print("XInputSetState function not found\n", .{});
-            xinput_set_state_ptr = &XInputSetStateStub;
+            xinput_set_state_ptr = &xInputSetStateStub;
         } else {
             std.debug.print("XInputSetState function loaded successfully\n", .{});
         }
@@ -211,7 +244,7 @@ pub fn LoadXInput() void {
     }
 }
 
-pub fn LoadXAudio2() void {
+pub fn loadXAudio2() void {
     const xaudio2_library: ?HMODULE = win_ext.LoadLibraryA("xaudio2_9.dll");
 
     if (xaudio2_library != null) {
@@ -219,7 +252,7 @@ pub fn LoadXAudio2() void {
         xaudio2_create_ptr = @ptrCast(win_ext.GetProcAddress(xaudio2_library.?, "XAudio2Create"));
         if (xaudio2_create_ptr == null) {
             std.debug.print("XAudio2Create function not found\n", .{});
-            xaudio2_create_ptr = &XAudio2CreateStub;
+            xaudio2_create_ptr = &xAudio2CreateStub;
         } else {
             std.debug.print("XAudio2Create function loaded successfully\n", .{});
         }
@@ -229,21 +262,21 @@ pub fn LoadXAudio2() void {
 }
 
 // Stub Functions
-pub fn XInputGetStateStub(dwUserIndex: DWORD, pInputState: *XINPUT_STATE) callconv(win.WINAPI) DWORD {
+pub fn xInputGetStateStub(dwUserIndex: DWORD, pInputState: *XINPUT_STATE) callconv(win.WINAPI) DWORD {
     _ = dwUserIndex;
     _ = pInputState;
     std.debug.print("XInputGetState - Stub\n", .{});
     return 0;
 }
 
-pub fn XInputSetStateStub(dwUserIndex: DWORD, pVibration: *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD {
+pub fn xInputSetStateStub(dwUserIndex: DWORD, pVibration: *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD {
     _ = dwUserIndex;
     _ = pVibration;
     std.debug.print("XInputSetState - Stub\n", .{});
     return 0;
 }
 
-pub fn XAudio2CreateStub(instance: *?*IXAudio2, flags: FLAGS, processor: UINT32) callconv(win.WINAPI) HRESULT {
+pub fn xAudio2CreateStub(instance: *?*IXAudio2, flags: FLAGS, processor: UINT32) callconv(win.WINAPI) HRESULT {
     _ = instance;
     _ = flags;
     _ = processor;
@@ -253,74 +286,74 @@ pub fn XAudio2CreateStub(instance: *?*IXAudio2, flags: FLAGS, processor: UINT32)
 }
 
 // Utility Functions
-pub fn getRectWidth(rect: RECT) c_int {
-    return rect.right - rect.left;
+pub fn getWindowDimensions(window: win.HWND) WindowDimensions {
+    var result: WindowDimensions = undefined;
+    var client_rect: RECT = undefined;
+    _ = win_ext.GetClientRect(window, &client_rect);
+
+    result.width = client_rect.right - client_rect.left;
+    result.height = client_rect.bottom - client_rect.top;
+    return result;
 }
 
-pub fn getRectHeight(rect: RECT) c_int {
-    return rect.bottom - rect.top;
-}
+// TODO:(Dean): This will get moved to the game layer
+pub fn renderWeirdGradient(buffer: *OffscreenBuffer, x_offset: c_int, y_offset: c_int) void {
+    _ = x_offset;
+    _ = y_offset;
 
-pub fn RenderWeirdGradient(buffer: *offscreen_buffer, x_offset: c_int, y_offset: c_int) void {
-
-    // ---Pixel---
-    // XX RR GG BB XX RR GG BB XX RR GG BB
-
-    const buffer_size: usize = @intCast(buffer.*.width * buffer.*.height * bytes_per_pixel);
-    var buffer_ptr: []u8 = @as([*]u8, @ptrCast(buffer.memory))[0..buffer_size];
-
-    const height: usize = @intCast(buffer.*.height);
-    const width: usize = @intCast(buffer.*.width);
-
-    //const row: *u8 = buffer.*.memory;
-    var row: c_int = 0;
-
-    for (0..height) |_| {
-        var col: c_int = 0;
-        var pixel: usize = @intCast(row * buffer.*.pitch);
-        for (0..width) |_| {
-            const blue: u8 = @intCast(@mod((col + x_offset), std.math.maxInt(u8)));
-            const green: u8 = @intCast(@mod((row + y_offset), std.math.maxInt(u8)));
-
-            buffer_ptr[pixel] = blue; // BB
-            buffer_ptr[pixel + 1] = green; // GG
-            buffer_ptr[pixel + 2] = 0; // RR
-            buffer_ptr[pixel + 3] = 0; // AA
-
-            col += 1;
-            pixel += bytes_per_pixel; // move to next pixel
-        }
-
-        row += 1;
-    }
-}
-
-pub fn resizeDIBSection(buffer: *offscreen_buffer, width: c_int, height: c_int) !void {
-    if (buffer.*.memory != null) {
-        _ = win.VirtualFree(buffer.*.memory.?, 0, MEM_RELEASE);
+    if (buffer.*.window_dimensions.width == 0 or buffer.*.window_dimensions.height == 0) {
+        return;
     }
 
-    buffer.*.width = width;
-    buffer.*.height = height;
+    std.debug.print("renderWeirdGradient: memory buffer size: {d}\n", .{buffer.*.memory.len});
 
-    buffer.*.info.bmiHeader.biSize = @sizeOf(BITMAPINFOHEADER);
-    buffer.*.info.bmiHeader.biWidth = buffer.*.width;
-    buffer.*.info.bmiHeader.biHeight = -buffer.*.height; // NOTE: This is negative to force the origin to be in the top left corner. It would be in the bottom left corner if biHeight was positive.
-    buffer.*.info.bmiHeader.biPlanes = 1;
-    buffer.*.info.bmiHeader.biBitCount = 32;
-    buffer.*.info.bmiHeader.biCompression = BI_RGB;
+    const window_width = buffer.*.window_dimensions.width;
+    const pitch: usize = @intCast(window_width * buffer.*.bytes_per_pixel);
 
-    const bitmap_mem_size: usize = @intCast(buffer.*.width * buffer.*.height * bytes_per_pixel);
-    buffer.*.memory = try win.VirtualAlloc(null, bitmap_mem_size, MEM_COMMIT, PAGE_READWRITE);
+    std.debug.assert(pitch > 0);
+    std.debug.assert(buffer.*.memory.len > 0);
 
-    buffer.*.pitch = buffer.*.width * bytes_per_pixel;
+    var pixel: usize = 0;
+    var col: i32 = 0;
+    while (pixel < buffer.*.memory.len) : ({
+        col += 1;
+        pixel += @intCast(buffer.*.bytes_per_pixel);
+    }) {
+        //  NOTE: Microsoft uses Little Endian Architecture
+        //  Engineers there wanted RGB to appear in order so they defined
+        //  rgb encoding to be reverse-order so that it shows up nicely in the
+        //  registers
+        //  - - - -
+        //  Memory: BB GG RR xx
+        //  Register: xx RR GG BB
+
+        const blue_pixel: usize = pixel;
+        const green_pixel: usize = pixel + 1;
+        const red_pixel: usize = pixel + 2;
+
+        // TODO:(Dean): When window is resized, new part of buffer is set to 10101010
+
+        // const pixel_row: c_int = @intCast(pixel / pitch);
+        // const pixel_col: c_int = @mod(col, buffer.*.window_dimensions.width);
+
+        // buffer.*.memory[blue_pixel] = @intCast(@mod(pixel_col + x_offset, std.math.maxInt(u8)));
+        // buffer.*.memory[green_pixel] = @intCast(@mod(pixel_row + y_offset, std.math.maxInt(u8)));
+        buffer.*.memory[blue_pixel] = 0;
+        buffer.*.memory[green_pixel] = 255;
+        buffer.*.memory[red_pixel] = 0;
+    }
+
+    std.debug.print("{d} pixels updated\n", .{pixel});
 }
 
-pub fn copyBufferToWindow(ctx: HDC, rect: RECT, buffer: offscreen_buffer) void {
-    const window_width = getRectWidth(rect);
-    const window_height = getRectHeight(rect);
+pub fn copyBufferToWindow(ctx: HDC, window_dimensions: WindowDimensions, buffer: OffscreenBuffer) void {
+    std.debug.print("copyBufferToWindows\n", .{});
+    const window_width = window_dimensions.width;
+    const window_height = window_dimensions.height;
+    const buffer_width = buffer.window_dimensions.width;
+    const buffer_height = buffer.window_dimensions.height;
 
-    _ = win_ext.StretchDIBits(ctx, 0, 0, buffer.width, buffer.height, 0, 0, window_width, window_height, buffer.memory.?, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
+    _ = win_ext.StretchDIBits(ctx, 0, 0, window_width, window_height, 0, 0, buffer_width, buffer_height, buffer.memory.ptr, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
 }
 
 pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPARAM) callconv(win.WINAPI) LRESULT {
@@ -328,14 +361,13 @@ pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPA
 
     switch (message) {
         WM_SIZE => {
-            var client_rect: RECT = undefined;
-            _ = win_ext.GetClientRect(window, &client_rect);
-            const width: c_int = getRectWidth(client_rect);
-            const height: c_int = getRectHeight(client_rect);
-            resizeDIBSection(&global_back_buffer, width, height) catch blk: {
-                result = win.E_UNEXPECTED;
+            const window_dimensions = getWindowDimensions(window);
+            global_back_buffer.resize(allocator, window_dimensions) catch blk: {
+                result = win.E_OUTOFMEMORY;
                 break :blk;
             };
+            _ = win_ext.InvalidateRect(window, null, 0);
+            std.debug.print("windowCallback - WM_SIZE: memory buffer size: {d}\n", .{global_back_buffer.memory.len});
         },
         WM_ACTIVATEAPP => {},
         WM_CLOSE => {
@@ -347,12 +379,11 @@ pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPA
         WM_PAINT => {
             var paint: PAINTSTRUCT = undefined;
             const device_ctx: HDC = win_ext.BeginPaint(window, &paint);
+            defer _ = win_ext.EndPaint(window, &paint);
 
-            var client_rect: RECT = undefined;
-            _ = win_ext.GetClientRect(window, &client_rect);
-
-            copyBufferToWindow(device_ctx, client_rect, global_back_buffer);
-            _ = win_ext.EndPaint(window, &paint);
+            const window_dimensions = getWindowDimensions(window);
+            renderWeirdGradient(&global_back_buffer, 0, 0); // NOTE:(Dean): This fixed the window resizing issue.
+            copyBufferToWindow(device_ctx, window_dimensions, global_back_buffer);
         },
         WM_KEYUP, WM_KEYDOWN, WM_SYSKEYUP, WM_SYSKEYDOWN => {
             const vk_code: usize = w_param;
@@ -371,39 +402,31 @@ pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPA
     return result;
 }
 
-pub fn littleEndianCopyToBuffer(buffer: []u8, value: i16) void {
-    std.debug.assert(buffer.len == 2);
-    const bits: u16 = @bitCast(value);
-    const low_bits: u8 = @truncate(bits);
-    const high_bits: u8 = @truncate((0xFF00 & bits) >> 8);
-
-    buffer[0] = low_bits;
-    buffer[1] = high_bits;
-}
-
 pub fn main() !void {
+    defer arena.deinit();
     std.log.debug("main: start\n", .{});
 
-    //var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    //var allocator = gpa.allocator();
-    //defer _ = gpa.deinit();
-
-    LoadXInput();
+    loadXInput();
     std.debug.print("main: after LoadXInput\n", .{});
 
-    LoadXAudio2();
+    loadXAudio2();
     std.debug.print("main: after LoadXAudio2\n", .{});
 
     var window_class = WNDCLASSEXA{ .cbSize = @sizeOf(WNDCLASSEXA), .style = CS_HREDRAW | CS_VREDRAW, .lpfnWndProc = windowCallback, .hInstance = @as(HINSTANCE, @ptrCast(win_ext.GetModuleHandleA(null))), .hIcon = null, .hIconSm = null, .hCursor = null, .hbrBackground = null, .lpszMenuName = null, .lpszClassName = "HandmadeHeroWindowClass" };
-
-    try resizeDIBSection(&global_back_buffer, 1280, 720);
 
     if (win_ext.RegisterClassExA(&window_class) != 0) {
         std.debug.print("window class registered\n", .{});
 
         const window_handle: HWND = win_ext.CreateWindowExA(WS_EX_TOPMOST, window_class.lpszClassName, "Handmade Hero: Zig Edition", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, null, null, window_class.hInstance, null).?;
 
-        var sound_output: sound_struct = undefined;
+        var client_rect: RECT = undefined;
+        _ = win_ext.GetClientRect(window_handle, &client_rect);
+        const window_dimensions = getWindowDimensions(window_handle);
+
+        try global_back_buffer.init(allocator, window_dimensions, default_pixel_size_in_bytes);
+        // global_back_buffer = try OffscreenBuffer.init(allocator, window_dimensions, default_pixel_size_in_bytes);
+
+        var sound_output: SoundInformation = undefined;
         sound_output.tone_hz = 256;
         sound_output.samples_per_second = 48000;
         sound_output.bytes_per_sample = @sizeOf(i16) * 2;
@@ -420,13 +443,13 @@ pub fn main() !void {
 
         const flags = FLAGS{};
 
-        if (failed(win_ext.CoInitializeEx(null, win_ext.COINIT_MULTITHREADED))) {
+        if (win_ext.FAILED(win_ext.CoInitializeEx(null, win_ext.COINIT_MULTITHREADED))) {
             std.debug.print("CoInitializeEx failed\n", .{});
         }
 
-        if (succeeded(xaudio2_create_ptr.?(&xaudio2_instance, flags, xa2.XAUDIO2_DEFAULT_PROCESSOR))) {
+        if (win_ext.SUCCEEDED(xaudio2_create_ptr.?(&xaudio2_instance, flags, xa2.XAUDIO2_DEFAULT_PROCESSOR))) {
             std.debug.print("XAudio2Create successful\n", .{});
-            if (succeeded(xaudio2_instance.?.CreateMasteringVoice(&mastering_voice, xa2.XAUDIO2_DEFAULT_CHANNELS, xa2.XAUDIO2_DEFAULT_SAMPLERATE, .{}, null, null, .GameEffects))) {
+            if (win_ext.SUCCEEDED(xaudio2_instance.?.CreateMasteringVoice(&mastering_voice, xa2.XAUDIO2_DEFAULT_CHANNELS, xa2.XAUDIO2_DEFAULT_SAMPLERATE, .{}, null, null, .GameEffects))) {
                 const cbSize: WORD = 0;
                 const nChannels: WORD = 2;
                 const wBitsPerSample: WORD = 16;
@@ -444,19 +467,16 @@ pub fn main() !void {
                     .nAvgBytesPerSec = nAvgBytesPerSec,
                 };
 
-                if (succeeded(xaudio2_instance.?.CreateSourceVoice(&source_voice, &wave_format, .{}, xa2.XAUDIO2_DEFAULT_FREQ_RATIO, null, null, null))) {
+                if (win_ext.SUCCEEDED(xaudio2_instance.?.CreateSourceVoice(&source_voice, &wave_format, .{}, xa2.XAUDIO2_DEFAULT_FREQ_RATIO, null, null, null))) {
                     std.debug.print("Source Voice created -- filling buffer\n", .{});
-                    var audio_buffer_ptr: []u8 = @as([*]u8, @ptrCast(audio_buffer))[0..sound_output.buffer_size];
-                    var buffer_index: u32 = 0;
-                    var phase: f32 = 0;
-                    while (buffer_index < sound_output.buffer_size) : (buffer_index = buffer_index + 2) {
-                        const period: f32 = @floatFromInt(sound_output.wave_period);
-                        phase += (2 * std.math.pi) / period;
+                    const audio_buffer_ptr: []u8 = @as([*]u8, @ptrCast(audio_buffer))[0..sound_output.buffer_size];
+                    var game_sound_output_buffer = game.GameOutputSoundBuffer{
+                        .samples = audio_buffer_ptr,
+                        .samples_per_second = sound_output.samples_per_second,
+                    };
 
-                        const sample: f32 = std.math.sin(phase) * 0xffff * sound_output.volume;
-                        const sample_value: i16 = @intFromFloat(sample);
-                        littleEndianCopyToBuffer(audio_buffer_ptr[buffer_index .. buffer_index + 2], sample_value);
-                    }
+                    game.outputSound(&game_sound_output_buffer, sound_output.tone_hz);
+
                     const xaudio2_buffer = BUFFER{
                         .Flags = .{ .END_OF_STREAM = true },
                         .AudioBytes = audio_buffer_size,
@@ -469,7 +489,7 @@ pub fn main() !void {
                         .pContext = null,
                     };
 
-                    if (succeeded(source_voice.?.SubmitSourceBuffer(&xaudio2_buffer, null))) {
+                    if (win_ext.SUCCEEDED(source_voice.?.SubmitSourceBuffer(&xaudio2_buffer, null))) {
                         _ = source_voice.?.Start(.{}, 0);
                     } else {
                         std.debug.print("SubmitSourceBuffer failed\n", .{});
@@ -487,12 +507,12 @@ pub fn main() !void {
         running = true;
 
         var xinput_first_pass: bool = true;
-        var x_offset: c_int = 0;
+        var x_offset: c_int = 0; // TODO:(Dean): GameState struct and game layer integration
         var y_offset: c_int = 0;
 
         while (running) {
             var msg: MSG = undefined;
-            while (win_ext.PeekMessageA(&msg, null, 0, 0, PM_REMOVE) == 1) {
+            while (win_ext.PeekMessageA(&msg, null, 0, 0, PM_REMOVE) != 0) {
                 if (msg.message == WM_QUIT) {
                     running = false;
                 }
@@ -585,13 +605,11 @@ pub fn main() !void {
 
             xinput_first_pass = false;
 
-            RenderWeirdGradient(&global_back_buffer, x_offset, y_offset);
+            renderWeirdGradient(&global_back_buffer, x_offset, y_offset);
 
             const device_context: HDC = win_ext.GetDC(window_handle);
-            var client_rect: RECT = undefined;
-            _ = win_ext.GetClientRect(window_handle, &client_rect);
 
-            copyBufferToWindow(device_context, client_rect, global_back_buffer);
+            copyBufferToWindow(device_context, window_dimensions, global_back_buffer);
             _ = win_ext.ReleaseDC(window_handle, device_context);
         }
     }

@@ -140,23 +140,36 @@ pub const WNDCLASSEXA = extern struct {
     hIconSm: ?HICON,
 };
 
+pub fn SUCCEEDED(return_code: HRESULT) bool {
+    if (return_code < 0) {
+        std.debug.print("Failed with error code: {x}", .{return_code});
+    }
+
+    return return_code >= 0;
+}
+
+pub fn FAILED(return_code: HRESULT) bool {
+    return return_code < 0;
+}
+
 pub const WNDPROC = *const fn (hwnd: HWND, uMsg: UINT, wParam: WPARAM, lparam: LPARAM) callconv(WINAPI) LRESULT;
 
-pub extern "user32" fn BeginPaint(windowHandle: HWND, paint: *PAINTSTRUCT) callconv(WINAPI) HDC;
+pub extern "kernel32" fn GetModuleHandleA(lpModuleName: ?LPCSTR) callconv(WINAPI) ?HMODULE;
+pub extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: LPCSTR) callconv(WINAPI) ?FARPROC;
+pub extern "kernel32" fn LoadLibraryA(lpLibFileName: LPCSTR) callconv(WINAPI) ?HMODULE;
+pub extern "gdi32" fn StretchDIBits(hdc: HDC, xDest: c_int, yDest: c_int, destWidth: c_int, destHeight: c_int, xSrc: c_int, ySrc: c_int, srcWidth: c_int, srcHeight: c_int, bits: LPVOID, bitmapInfo: *const BITMAPINFO, iUsage: UINT, rop: DWORD) callconv(WINAPI) c_int;
 pub extern "ole32" fn CoInitializeEx(pvReserved: ?LPVOID, dwCoInit: DWORD) callconv(WINAPI) HRESULT;
+pub extern "user32" fn BeginPaint(windowHandle: HWND, paint: *PAINTSTRUCT) callconv(WINAPI) HDC;
 pub extern "user32" fn CreateWindowExA(dwExStyle: DWORD, lpClassName: ?LPCSTR, lpWindowName: ?LPCSTR, dwStyle: DWORD, X: c_int, Y: c_int, nWidth: c_int, nHeight: c_int, hWindParent: ?HWND, hMenu: ?HMENU, hInstance: HINSTANCE, lpParam: ?LPVOID) callconv(WINAPI) ?HWND;
 pub extern "user32" fn DefWindowProcA(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) LRESULT;
 pub extern "user32" fn DispatchMessageA(lpMsg: *const MSG) callconv(WINAPI) LRESULT;
 pub extern "user32" fn EndPaint(windowHandle: HWND, paint: *const PAINTSTRUCT) callconv(WINAPI) BOOL;
 pub extern "user32" fn GetClientRect(windowHandle: HWND, rect: *RECT) callconv(WINAPI) BOOL;
 pub extern "user32" fn GetDC(hWnd: HWND) callconv(WINAPI) HDC;
-pub extern "kernel32" fn GetModuleHandleA(lpModuleName: ?LPCSTR) callconv(WINAPI) ?HMODULE;
-pub extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: LPCSTR) callconv(WINAPI) ?FARPROC;
-pub extern "kernel32" fn LoadLibraryA(lpLibFileName: LPCSTR) callconv(WINAPI) ?HMODULE;
+pub extern "user32" fn InvalidateRect(windowHandle: HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(WINAPI) BOOL;
 pub extern "user32" fn PeekMessageA(lpMsg: *const MSG, hWnd: ?HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT, wRemoveMsg: UINT) callconv(WINAPI) BOOL;
 pub extern "user32" fn RegisterClassExA(*const WNDCLASSEXA) callconv(WINAPI) ATOM;
 pub extern "user32" fn ReleaseDC(hWnd: HWND, hDC: HDC) callconv(WINAPI) c_int;
-pub extern "gdi32" fn StretchDIBits(hdc: HDC, xDest: c_int, yDest: c_int, destWidth: c_int, destHeight: c_int, xSrc: c_int, ySrc: c_int, srcWidth: c_int, srcHeight: c_int, bits: LPVOID, bitmapInfo: *const BITMAPINFO, iUsage: UINT, rop: DWORD) callconv(WINAPI) c_int;
 pub extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(WINAPI) BOOL;
 
 pub const IUnknown = extern struct {
