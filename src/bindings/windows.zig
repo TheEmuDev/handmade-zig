@@ -1,8 +1,6 @@
 // Based on ZWindows
 const std = @import("std");
 
-pub usingnamespace std.os.windows;
-
 const ATOM = std.os.windows.ATOM;
 const BOOL = std.os.windows.BOOL;
 const BYTE = std.os.windows.BYTE;
@@ -34,7 +32,7 @@ const ULONG = std.os.windows.ULONG;
 const WORD = std.os.windows.WORD;
 const WPARAM = std.os.windows.WPARAM;
 
-const WINAPI = std.os.windows.WINAPI;
+const WINAPI = std.builtin.CallingConvention.winapi;
 
 pub const BI_RGB = 0x0000;
 pub const COINIT_MULTITHREADED = 0x3;

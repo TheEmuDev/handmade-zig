@@ -5,6 +5,7 @@ const win_ext = @import("bindings/windows.zig");
 const xa2 = @import("bindings/xaudio2.zig");
 const xinput = @import("bindings/xinput.zig");
 
+const winapi = std.builtin.CallingConvention.winapi;
 const win = std.os.windows;
 const log = std.log;
 
@@ -149,14 +150,18 @@ const WS_OVERLAPPEDWINDOW = win_ext.WS_OVERLAPPEDWINDOW;
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const allocator = arena.allocator();
 
-var running: bool = undefined;
-var global_back_buffer: OffscreenBuffer = undefined;
+var game_memory: game.GameMemory = undefined;
+var offscreen_buffer: OffscreenBuffer = undefined;
 
-var xinput_get_state_ptr: ?*const fn (DWORD, *XINPUT_STATE) callconv(win.WINAPI) DWORD = xInputGetStateStub;
-var xinput_set_state_ptr: ?*const fn (DWORD, *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD = xInputSetStateStub;
-var xaudio2_create_ptr: ?*const fn (*?*IXAudio2, FLAGS, UINT32) callconv(win.WINAPI) HRESULT = xAudio2CreateStub;
+var xinput_get_state_ptr: ?*const fn (DWORD, *XINPUT_STATE) callconv(winapi) DWORD = xInputGetStateStub;
+var xinput_set_state_ptr: ?*const fn (DWORD, *XINPUT_VIBRATION) callconv(winapi) DWORD = xInputSetStateStub;
+var xaudio2_create_ptr: ?*const fn (*?*IXAudio2, FLAGS, UINT32) callconv(winapi) HRESULT = xAudio2CreateStub;
+
+var running: bool = undefined;
 
 const default_pixel_size_in_bytes: c_int = 4;
+const default_sound_channels: u32 = 2;
+// const default_sound_buffers: usize = 3;
 
 // NOTE:(Dean): Pixels are always 32-bits wide, memory order: BB GG RR XX
 const OffscreenBuffer = struct {
@@ -202,21 +207,52 @@ const OffscreenBuffer = struct {
         self.*.info.bmiHeader.biWidth = new_width;
         self.*.info.bmiHeader.biHeight = -new_height; // NOTE:(Dean) See Note from init()
     }
+
+    pub fn toGameOffscreenBuffer(self: *OffscreenBuffer) game.GameOffscreenBuffer {
+        return game.GameOffscreenBuffer{
+            .memory = self.*.memory,
+            .width = self.*.window_dimensions.width,
+            .height = self.*.window_dimensions.height,
+            .bytes_per_pixel = self.*.bytes_per_pixel,
+        };
+    }
+};
+
+const SoundBuffer = struct {
+    // buffers: [default_sound_buffers][]u8,
+    buffer: []u8,
+    num_channels: i32,
+    samples_per_second: i32,
+    tone_hz: i32,
+    volume: f32,
+
+    pub fn init(self: *SoundBuffer, alloc: std.mem.Allocator, num_channels: i32, samples_per_second: i32, tone_hz: i32, volume: f32) !void {
+        self.*.num_channels = num_channels;
+        self.*.samples_per_second = samples_per_second;
+        self.*.tone_hz = tone_hz;
+        self.*.volume = volume;
+
+        const buffer_size: usize = @intCast(self.*.samples_per_second * self.*.num_channels * @sizeOf(i16));
+        // self.*.buffers = try alloc.alloc([]u8, default_sound_buffers);
+        self.*.buffer = try alloc.alloc(u8, buffer_size);
+
+        // for (self.*.buffers) |*buf| {
+        //     buf.* = try alloc.alloc(u8, buffer_size);
+        // }
+    }
+
+    pub fn toGameOutputSoundBuffer(self: SoundBuffer) game.GameOutputSoundBuffer {
+        return .{
+            // .samples = self.buffers,
+            .samples = self.buffer,
+            .samples_per_second = self.samples_per_second,
+        };
+    }
 };
 
 const WindowDimensions = struct {
     width: i32,
     height: i32,
-};
-
-const SoundInformation = struct {
-    samples_per_second: u32,
-    bytes_per_sample: u32,
-    tone_hz: u32,
-    buffer_size: u32,
-    wave_period: u32,
-    t_sine: f32,
-    volume: f32,
 };
 
 pub fn loadXInput() void {
@@ -262,21 +298,21 @@ pub fn loadXAudio2() void {
 }
 
 // Stub Functions
-pub fn xInputGetStateStub(dwUserIndex: DWORD, pInputState: *XINPUT_STATE) callconv(win.WINAPI) DWORD {
+pub fn xInputGetStateStub(dwUserIndex: DWORD, pInputState: *XINPUT_STATE) callconv(winapi) DWORD {
     _ = dwUserIndex;
     _ = pInputState;
     std.debug.print("XInputGetState - Stub\n", .{});
     return 0;
 }
 
-pub fn xInputSetStateStub(dwUserIndex: DWORD, pVibration: *XINPUT_VIBRATION) callconv(win.WINAPI) DWORD {
+pub fn xInputSetStateStub(dwUserIndex: DWORD, pVibration: *XINPUT_VIBRATION) callconv(winapi) DWORD {
     _ = dwUserIndex;
     _ = pVibration;
     std.debug.print("XInputSetState - Stub\n", .{});
     return 0;
 }
 
-pub fn xAudio2CreateStub(instance: *?*IXAudio2, flags: FLAGS, processor: UINT32) callconv(win.WINAPI) HRESULT {
+pub fn xAudio2CreateStub(instance: *?*IXAudio2, flags: FLAGS, processor: UINT32) callconv(winapi) HRESULT {
     _ = instance;
     _ = flags;
     _ = processor;
@@ -296,96 +332,47 @@ pub fn getWindowDimensions(window: win.HWND) WindowDimensions {
     return result;
 }
 
-// TODO:(Dean): This will get moved to the game layer
-pub fn renderWeirdGradient(buffer: *OffscreenBuffer, x_offset: c_int, y_offset: c_int) void {
-    _ = x_offset;
-    _ = y_offset;
-
-    if (buffer.*.window_dimensions.width == 0 or buffer.*.window_dimensions.height == 0) {
-        return;
-    }
-
-    std.debug.print("renderWeirdGradient: memory buffer size: {d}\n", .{buffer.*.memory.len});
-
-    const window_width = buffer.*.window_dimensions.width;
-    const pitch: usize = @intCast(window_width * buffer.*.bytes_per_pixel);
-
-    std.debug.assert(pitch > 0);
-    std.debug.assert(buffer.*.memory.len > 0);
-
-    var pixel: usize = 0;
-    var col: i32 = 0;
-    while (pixel < buffer.*.memory.len) : ({
-        col += 1;
-        pixel += @intCast(buffer.*.bytes_per_pixel);
-    }) {
-        //  NOTE: Microsoft uses Little Endian Architecture
-        //  Engineers there wanted RGB to appear in order so they defined
-        //  rgb encoding to be reverse-order so that it shows up nicely in the
-        //  registers
-        //  - - - -
-        //  Memory: BB GG RR xx
-        //  Register: xx RR GG BB
-
-        const blue_pixel: usize = pixel;
-        const green_pixel: usize = pixel + 1;
-        const red_pixel: usize = pixel + 2;
-
-        // TODO:(Dean): When window is resized, new part of buffer is set to 10101010
-
-        // const pixel_row: c_int = @intCast(pixel / pitch);
-        // const pixel_col: c_int = @mod(col, buffer.*.window_dimensions.width);
-
-        // buffer.*.memory[blue_pixel] = @intCast(@mod(pixel_col + x_offset, std.math.maxInt(u8)));
-        // buffer.*.memory[green_pixel] = @intCast(@mod(pixel_row + y_offset, std.math.maxInt(u8)));
-        buffer.*.memory[blue_pixel] = 0;
-        buffer.*.memory[green_pixel] = 255;
-        buffer.*.memory[red_pixel] = 0;
-    }
-
-    std.debug.print("{d} pixels updated\n", .{pixel});
-}
-
 pub fn copyBufferToWindow(ctx: HDC, window_dimensions: WindowDimensions, buffer: OffscreenBuffer) void {
-    std.debug.print("copyBufferToWindows\n", .{});
-    const window_width = window_dimensions.width;
-    const window_height = window_dimensions.height;
-    const buffer_width = buffer.window_dimensions.width;
-    const buffer_height = buffer.window_dimensions.height;
-
-    _ = win_ext.StretchDIBits(ctx, 0, 0, window_width, window_height, 0, 0, buffer_width, buffer_height, buffer.memory.ptr, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
+    _ = win_ext.StretchDIBits(ctx, 0, 0, window_dimensions.width, window_dimensions.height, 0, 0, buffer.window_dimensions.width, buffer.window_dimensions.height, buffer.memory.ptr, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPARAM) callconv(win.WINAPI) LRESULT {
+pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPARAM) callconv(winapi) LRESULT {
     var result: LRESULT = 0;
 
     switch (message) {
-        WM_SIZE => {
-            const window_dimensions = getWindowDimensions(window);
-            global_back_buffer.resize(allocator, window_dimensions) catch blk: {
-                result = win.E_OUTOFMEMORY;
-                break :blk;
-            };
-            _ = win_ext.InvalidateRect(window, null, 0);
-            std.debug.print("windowCallback - WM_SIZE: memory buffer size: {d}\n", .{global_back_buffer.memory.len});
+        WM_ACTIVATEAPP => {
+            std.debug.print("WM_ACTIVATEAPP\n", .{});
         },
-        WM_ACTIVATEAPP => {},
         WM_CLOSE => {
+            std.debug.print("WM_CLOSE\n", .{});
             running = false;
         },
         WM_DESTROY => {
+            std.debug.print("WM_DESTROY\n", .{});
             running = false;
         },
+        WM_SIZE => {
+            std.debug.print("WM_SIZE\n", .{});
+            const window_dimensions = getWindowDimensions(window);
+            offscreen_buffer.resize(allocator, window_dimensions) catch blk: {
+                result = win.E_OUTOFMEMORY;
+                break :blk;
+            };
+        },
         WM_PAINT => {
+            std.debug.print("WM_PAINT\n", .{});
             var paint: PAINTSTRUCT = undefined;
             const device_ctx: HDC = win_ext.BeginPaint(window, &paint);
             defer _ = win_ext.EndPaint(window, &paint);
 
             const window_dimensions = getWindowDimensions(window);
-            renderWeirdGradient(&global_back_buffer, 0, 0); // NOTE:(Dean): This fixed the window resizing issue.
-            copyBufferToWindow(device_ctx, window_dimensions, global_back_buffer);
+            copyBufferToWindow(device_ctx, window_dimensions, offscreen_buffer);
+
+            // NOTE:(Dean): all new memory is set to 0xAA -- this turns the window white until another render pass happens.
         },
         WM_KEYUP, WM_KEYDOWN, WM_SYSKEYUP, WM_SYSKEYDOWN => {
+            // TODO:(Dean): log message
+
             const vk_code: usize = w_param;
             const is_down: bool = ((l_param & (1 << 30)) != 0);
             const was_down: bool = ((l_param & (1 << 31)) == 0);
@@ -402,40 +389,40 @@ pub fn windowCallback(window: HWND, message: UINT, w_param: WPARAM, l_param: LPA
     return result;
 }
 
+// TODO:(Dean): Implement this --- method inside game struct?
+fn processDigitalButton(prev_state: *game.GameButtonState, new_state: *game.GameButtonState, xinput_button_state: DWORD, button_bit: DWORD) void {
+    new_state.*.is_down = (xinput_button_state & button_bit) == button_bit;
+    new_state.*.state_transition_count = if (prev_state.*.is_down != new_state.*.is_down) 1 else 0;
+}
+
 pub fn main() !void {
     defer arena.deinit();
     std.log.debug("main: start\n", .{});
 
     loadXInput();
-    std.debug.print("main: after LoadXInput\n", .{});
+    std.debug.print("main: XInput library loaded\n", .{});
 
     loadXAudio2();
-    std.debug.print("main: after LoadXAudio2\n", .{});
+    std.debug.print("main: XAudio2 library loaded\n", .{});
 
     var window_class = WNDCLASSEXA{ .cbSize = @sizeOf(WNDCLASSEXA), .style = CS_HREDRAW | CS_VREDRAW, .lpfnWndProc = windowCallback, .hInstance = @as(HINSTANCE, @ptrCast(win_ext.GetModuleHandleA(null))), .hIcon = null, .hIconSm = null, .hCursor = null, .hbrBackground = null, .lpszMenuName = null, .lpszClassName = "HandmadeHeroWindowClass" };
 
     if (win_ext.RegisterClassExA(&window_class) != 0) {
-        std.debug.print("window class registered\n", .{});
+        std.debug.print("main: window class registered\n", .{});
 
         const window_handle: HWND = win_ext.CreateWindowExA(WS_EX_TOPMOST, window_class.lpszClassName, "Handmade Hero: Zig Edition", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, null, null, window_class.hInstance, null).?;
 
-        var client_rect: RECT = undefined;
-        _ = win_ext.GetClientRect(window_handle, &client_rect);
-        const window_dimensions = getWindowDimensions(window_handle);
+        const default_window_dimensions = WindowDimensions{ .width = 1280, .height = 720 };
 
-        try global_back_buffer.init(allocator, window_dimensions, default_pixel_size_in_bytes);
-        // global_back_buffer = try OffscreenBuffer.init(allocator, window_dimensions, default_pixel_size_in_bytes);
+        try offscreen_buffer.init(allocator, default_window_dimensions, default_pixel_size_in_bytes);
 
-        var sound_output: SoundInformation = undefined;
-        sound_output.tone_hz = 256;
-        sound_output.samples_per_second = 48000;
-        sound_output.bytes_per_sample = @sizeOf(i16) * 2;
-        sound_output.buffer_size = sound_output.samples_per_second * sound_output.bytes_per_sample;
-        sound_output.volume = 0.25;
-        sound_output.wave_period = @divFloor(sound_output.samples_per_second, sound_output.tone_hz);
+        var sound_buffer: SoundBuffer = undefined;
+        const samples_per_second: u32 = 48000;
+        const tone_hz: u32 = 256;
+        const volume: f32 = 0.25;
 
-        const audio_buffer_size = sound_output.buffer_size;
-        const audio_buffer: ?*anyopaque = try win.VirtualAlloc(null, audio_buffer_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        try sound_buffer.init(allocator, default_sound_channels, samples_per_second, tone_hz, volume);
+        try game_memory.init(allocator, game.megabytesToBytes(64), game.gigabytesToBytes(4));
 
         var xaudio2_instance: ?*IXAudio2 = undefined;
         var mastering_voice: ?*IMasteringVoice = undefined;
@@ -453,7 +440,7 @@ pub fn main() !void {
                 const cbSize: WORD = 0;
                 const nChannels: WORD = 2;
                 const wBitsPerSample: WORD = 16;
-                const nSamplesPerSec: DWORD = sound_output.samples_per_second;
+                const nSamplesPerSec: DWORD = @intCast(sound_buffer.samples_per_second);
                 const nBlockAlign: WORD = (nChannels * wBitsPerSample) / 8;
                 const nAvgBytesPerSec: DWORD = nSamplesPerSec * nBlockAlign;
 
@@ -469,18 +456,15 @@ pub fn main() !void {
 
                 if (win_ext.SUCCEEDED(xaudio2_instance.?.CreateSourceVoice(&source_voice, &wave_format, .{}, xa2.XAUDIO2_DEFAULT_FREQ_RATIO, null, null, null))) {
                     std.debug.print("Source Voice created -- filling buffer\n", .{});
-                    const audio_buffer_ptr: []u8 = @as([*]u8, @ptrCast(audio_buffer))[0..sound_output.buffer_size];
-                    var game_sound_output_buffer = game.GameOutputSoundBuffer{
-                        .samples = audio_buffer_ptr,
-                        .samples_per_second = sound_output.samples_per_second,
-                    };
-
-                    game.outputSound(&game_sound_output_buffer, sound_output.tone_hz);
+                    var game_sound_output_buffer = sound_buffer.toGameOutputSoundBuffer();
+                    game.outputSound(&game_sound_output_buffer, sound_buffer.tone_hz);
 
                     const xaudio2_buffer = BUFFER{
                         .Flags = .{ .END_OF_STREAM = true },
-                        .AudioBytes = audio_buffer_size,
-                        .pAudioData = audio_buffer_ptr.ptr,
+                        .AudioBytes = @intCast(sound_buffer.buffer.len),
+                        .pAudioData = sound_buffer.buffer.ptr,
+                        // .AudioBytes = @intCast(sound_buffer.buffers[0].len),
+                        // .pAudioData = sound_buffer.buffers[0].ptr,
                         .PlayBegin = 0,
                         .PlayLength = 0,
                         .LoopBegin = 0,
@@ -507,8 +491,11 @@ pub fn main() !void {
         running = true;
 
         var xinput_first_pass: bool = true;
-        var x_offset: c_int = 0; // TODO:(Dean): GameState struct and game layer integration
-        var y_offset: c_int = 0;
+        var input: [2]game.GameInput = undefined;
+        var new_input = &input[0]; // TODO:(Dean): double check this as update and render stuff
+        var old_input = &input[1];
+        new_input.*.init();
+        old_input.*.init();
 
         while (running) {
             var msg: MSG = undefined;
@@ -522,8 +509,12 @@ pub fn main() !void {
             }
 
             var controller_index: DWORD = 0;
+
             while (controller_index < XUSER_MAX_COUNT) : (controller_index += 1) {
+                const new_controller = &new_input.*.controllers[controller_index];
+                const old_controller = &old_input.*.controllers[controller_index];
                 var controller_state: XINPUT_STATE = undefined;
+
                 const xinput_response: DWORD = xinput_get_state_ptr.?(controller_index, &controller_state);
                 if (xinput_response == ERROR_SUCCESS) {
                     if (xinput_first_pass == true) {
@@ -539,17 +530,45 @@ pub fn main() !void {
                     const dpad_down: BOOL = (pad.*.wButtons & GAMEPAD_DPAD_DOWN);
                     const dpad_left: BOOL = (pad.*.wButtons & GAMEPAD_DPAD_LEFT);
                     const dpad_right: BOOL = (pad.*.wButtons & GAMEPAD_DPAD_RIGHT);
-                    const start: BOOL = (pad.*.wButtons & GAMEPAD_START);
-                    const back: BOOL = (pad.*.wButtons & GAMEPAD_BACK);
-                    const left_shoulder: BOOL = (pad.*.wButtons & GAMEPAD_LEFT_SHOULDER);
-                    const right_shoulder: BOOL = (pad.*.wButtons & GAMEPAD_RIGHT_SHOULDER);
-                    const button_a: BOOL = (pad.*.wButtons & GAMEPAD_A);
-                    const button_b: BOOL = (pad.*.wButtons & GAMEPAD_B);
-                    const button_x: BOOL = (pad.*.wButtons & GAMEPAD_X);
-                    const button_y: BOOL = (pad.*.wButtons & GAMEPAD_Y);
 
-                    const left_stick_horiz: i16 = (pad.*.sThumbLX);
-                    const left_stick_vert: i16 = (pad.*.sThumbLY);
+                    new_controller.*.is_analog = true;
+                    new_controller.*.start_x = old_controller.*.end_x;
+                    new_controller.*.start_y = old_controller.*.end_y;
+
+                    var thumb_x: f32 = undefined;
+                    const f_thumblx: f32 = @floatFromInt(pad.*.sThumbLX);
+
+                    if (pad.*.sThumbLX < 0) {
+                        thumb_x = f_thumblx / 32768.0;
+                    } else {
+                        thumb_x = f_thumblx / 32767.0;
+                    }
+
+                    var thumb_y: f32 = undefined;
+                    const f_thumbly: f32 = @floatFromInt(pad.*.sThumbLY);
+
+                    if (pad.*.sThumbLY < 0) {
+                        thumb_y = f_thumbly / 32768.0;
+                    } else {
+                        thumb_y = f_thumbly / 32767.0;
+                    }
+
+                    new_controller.*.min_x = thumb_x;
+                    new_controller.*.max_x = thumb_x;
+                    new_controller.*.end_x = thumb_x;
+
+                    new_controller.*.min_y = thumb_y;
+                    new_controller.*.max_y = thumb_y;
+                    new_controller.*.end_y = thumb_y;
+
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.Start)], &new_controller.buttons[@intFromEnum(game.GameButtons.Start)], pad.*.wButtons, GAMEPAD_START);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.Back)], &new_controller.buttons[@intFromEnum(game.GameButtons.Back)], pad.*.wButtons, GAMEPAD_BACK);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.LeftShoulder)], &new_controller.buttons[@intFromEnum(game.GameButtons.LeftShoulder)], pad.*.wButtons, GAMEPAD_LEFT_SHOULDER);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.RightShoulder)], &new_controller.buttons[@intFromEnum(game.GameButtons.RightShoulder)], pad.*.wButtons, GAMEPAD_RIGHT_SHOULDER);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.South)], &new_controller.buttons[@intFromEnum(game.GameButtons.South)], pad.*.wButtons, GAMEPAD_A);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.East)], &new_controller.buttons[@intFromEnum(game.GameButtons.East)], pad.*.wButtons, GAMEPAD_B);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.West)], &new_controller.buttons[@intFromEnum(game.GameButtons.West)], pad.*.wButtons, GAMEPAD_X);
+                    processDigitalButton(&old_controller.buttons[@intFromEnum(game.GameButtons.North)], &new_controller.buttons[@intFromEnum(game.GameButtons.North)], pad.*.wButtons, GAMEPAD_Y);
 
                     if (dpad_up != 0) {
                         std.debug.print("UP pressed on D-Pad of Controller {d}\n", .{controller_index});
@@ -563,37 +582,6 @@ pub fn main() !void {
                     if (dpad_right != 0) {
                         std.debug.print("RIGHT pressed on D-Pad of Controller {d}\n", .{controller_index});
                     }
-                    if (start != 0) {
-                        std.debug.print("START button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (back != 0) {
-                        std.debug.print("BACK button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (left_shoulder != 0) {
-                        std.debug.print("LEFT SHOULDER button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (right_shoulder != 0) {
-                        std.debug.print("RIGHT SHOULDER button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (button_a != 0) {
-                        std.debug.print("A button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (button_b != 0) {
-                        std.debug.print("B button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (button_x != 0) {
-                        std.debug.print("X button pressed on Controller {d}\n", .{controller_index});
-                    }
-                    if (button_y != 0) {
-                        std.debug.print("Y button pressed on Controller {d}\n", .{controller_index});
-                    }
-
-                    //std.debug.print("Controller: {d} - Left Stick Horizontal: {d}\n", .{ controller_index, left_stick_horiz });
-                    //std.debug.print("Controller: {d} - Left Stick Vertical: {d}\n", .{ controller_index, left_stick_vert });
-
-                    // TODO:(Dean): We will eventually handle the dead zone properly
-                    x_offset += @divTrunc(left_stick_horiz, 4096);
-                    y_offset += @divTrunc(left_stick_vert, 4096);
                 } else {
                     // NOTE:(Dean): Controller is unavailable
                     if (xinput_first_pass == true) {
@@ -605,15 +593,30 @@ pub fn main() !void {
 
             xinput_first_pass = false;
 
-            renderWeirdGradient(&global_back_buffer, x_offset, y_offset);
+            // TODO:(Dean): Need to rethink how the platform layer and game layer are passing info back and forth
+            // var game_offscreen_buffer = offscreen_buffer.toGameOffscreenBuffer();
+
+            var game_offscreen_buffer = game.GameOffscreenBuffer{
+                .memory = offscreen_buffer.memory,
+                .height = offscreen_buffer.window_dimensions.height,
+                .width = offscreen_buffer.window_dimensions.width,
+                .bytes_per_pixel = offscreen_buffer.bytes_per_pixel,
+            };
+
+            var game_sound_buffer = sound_buffer.toGameOutputSoundBuffer();
+
+            game.updateAndRender(&game_memory, new_input, &game_offscreen_buffer, &game_sound_buffer);
 
             const device_context: HDC = win_ext.GetDC(window_handle);
+            defer _ = win_ext.ReleaseDC(window_handle, device_context);
+            const window_dimensions = getWindowDimensions(window_handle);
+            copyBufferToWindow(device_context, window_dimensions, offscreen_buffer);
 
-            copyBufferToWindow(device_context, window_dimensions, global_back_buffer);
-            _ = win_ext.ReleaseDC(window_handle, device_context);
+            const temp_input = new_input;
+            new_input = old_input;
+            old_input = temp_input;
         }
     }
     std.debug.print("Program Closing: Success\n", .{});
-
     return;
 }
